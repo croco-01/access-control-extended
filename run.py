@@ -98,12 +98,12 @@ LCD_INTERFACE = "auto"   # "auto" | "gpio" | "i2c"
 # (GPIO.BOARD) internally, and the buzzer uses BOARD too. RPi.GPIO only
 # allows ONE numbering mode per process, so everything has to agree.
 # RS, E, D6, D7 match the original wiring plan (BCM12/BOARD32,
-# BCM7/BOARD26, BCM24/BOARD18, BCM23/BOARD16). D4 and D5 were MOVED from
+# BCM7/BOARD29, BCM24/BOARD18, BCM23/BOARD16). D4 and D5 were MOVED from
 # their original pins (BOARD24, BOARD22) to BOARD13 and BOARD15, because
 # 24 and 22 are already used by the RFID reader (SDA/CS and RST). If you
 # rewire the LCD to different physical pins, update the map below to match.
 LCD_PIN_RS = 32                   # BOARD 32 (BCM12)
-LCD_PIN_E = 26                    # BOARD 26 (BCM7)
+LCD_PIN_E = 29                    # BOARD 29 (BCM7)
 LCD_PINS_DATA = [13, 15, 18, 16]  # D4, D5, D6, D7 (D4/D5 moved off RFID pins)
 
 # --- I2C (backpack) settings ---
