@@ -2,7 +2,7 @@
 #
 # Usage:
 #   chmod +x setup.sh        
-#   sudo ./setup.sh --auto  
+#   sudo ./setup.sh
 
 set +e  # keep checking even after individual failures
 
@@ -27,26 +27,14 @@ section() { printf "\n${BOLD}%s${RESET}\n" "$1"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_FILE="$SCRIPT_DIR/run.py"
 
-# ---- argument parsing ----------------------------------------------------
-#
-# Modes:
-#   (none)  report-only
-#   --auto  unattended: do every fix immediately, no prompts
+# Setup applies available fixes by default. No command-line flag is needed.
 
-AUTO_MODE=0
-for arg in "$@"; do
-    case "$arg" in
-        --auto) AUTO_MODE=1 ;;
-        *)      warn "Unknown option '$arg' ignored." ;;
-    esac
-done
-
-APT_PACKAGES="python3-pip python3-dev python3-setuptools python3-venv i2c-tools"
+APT_PACKAGES="python3-pip python3-dev python3-setuptools python3-venv i2c-tools python3-tk"
 REQUIRED_GROUPS="gpio spi i2c dialout"
 
 # ---- figure out who the "real" (non-root) user is ------------------------
 #
-# This matters a lot when run via `sudo ./setup.sh --auto`: $USER and
+# This matters a lot when run via `sudo ./setup.sh`: $USER and
 # `whoami` would report "root" in that case, which is NOT who should be
 # added to the gpio/spi/dialout groups. SUDO_USER holds the original login
 # user when invoked through sudo, so we prefer that whenever it's set and
@@ -76,7 +64,7 @@ as_root() {
 }
 
 # Helper: run python3 as the real login user, not root. This matters
-# because `sudo ./setup.sh --auto` installs pip packages into the
+# because `sudo ./setup.sh` installs pip packages into the
 # real user's home directory (~/.local/lib/...), which root's own python3
 # cannot see. Every import check must run as that same user or it will
 # report a false FAIL right after a successful install.
@@ -88,28 +76,21 @@ run_as_real_user() {
     fi
 }
 
-# Decide whether to actually perform a fix action:
-#   --auto  -> always yes
-#   neither -> never (report-only)
+# Setup always applies available fixes.
 should_fix() {
-    [ "$AUTO_MODE" -eq 1 ]
+    return 0
 }
 
 printf "${BOLD}=========================================================\n"
 printf " ACCESS CONTROL SYSTEM - SETUP CHECK\n"
 printf "=========================================================${RESET}\n"
-info "v1.5: RFID, fingerprint sensor, buzzer, and LCD are ALL required."
-info "run.py will refuse to start the menu until every one of them"
-info "initializes successfully - this check helps catch problems"
-info "with any of them before you try to run the app."
-
-if [ "$AUTO_MODE" -eq 1 ]; then
-    info "Running in AUTO mode: missing pieces will be installed automatically."
-    if [ "$RUNNING_AS_ROOT" -eq 0 ]; then
-        warn "Not running as root. --auto works best with: sudo ./setup.sh --auto"
-    fi
-    info "Detected login user for group membership / permissions: $REAL_USER"
+info "Missing packages and enabled interfaces will be fixed automatically."
+info "RFID, fingerprint, buzzer, and LCD hardware are optional: the app starts"
+info "without them, but the features that depend on an offline device are unavailable."
+if [ "$RUNNING_AS_ROOT" -eq 0 ]; then
+    warn "Not running as root. Run: sudo ./setup.sh"
 fi
+info "Detected login user for group membership / permissions: $REAL_USER"
 
 # ---- 1. Platform sanity --------------------------------------------------
 
@@ -282,7 +263,7 @@ fi
 # file that blocks plain `pip install` system-wide (PEP 668). We already
 # pass --break-system-packages to pip below, which is normally enough on
 # its own; removing the marker here too is a belt-and-suspenders step some
-# environments still need. Only done in --auto mode since it's a system
+# environments still need. This script applies the change by default, and it
 # change, and made safe to re-run (glob may match nothing / multiple
 # python3.X dirs).
 
@@ -536,13 +517,28 @@ PYEOF
         ok "GPIO pin $BUZZER_PIN_BOARD (BOARD) is free and claimable for the buzzer"
         info "This confirms the pin is usable, not that a buzzer is physically connected."
     else
-        warn "Could not claim GPIO pin $BUZZER_PIN_BOARD (BOARD) for the buzzer. It may be in use by another process/overlay, or wiring may be off. As of v1.5 this will block run.py from starting."
+        warn "Could not claim GPIO pin $BUZZER_PIN_BOARD (BOARD) for the buzzer. It may be in use by another process/overlay, or wiring may be off."
     fi
 else
-    warn "RPi.GPIO not importable; cannot probe the buzzer pin. As of v1.5 this will block run.py from starting (the buzzer is now required)."
+    warn "RPi.GPIO not importable; cannot probe the buzzer pin."
 fi
-info "As of v1.5, the buzzer is REQUIRED, not optional: run.py will refuse to start the menu until it initializes successfully (along with RFID, fingerprint, and LCD)."
+info "The buzzer is optional; audio feedback is unavailable while it is offline."
 info "Check it live via the app's menu: option 5 (System Status) -> Buzzer section -> Test buzzer now?"
+
+# ---- 9b. Touchscreen GUI (optional - only needed for gui.py) --------------
+
+section "Touchscreen GUI (gui.py, optional)"
+
+if run_as_real_user python3 -c "import tkinter" >/dev/null 2>&1; then
+    ok "tkinter importable (needed only if you run gui.py, not run.py)"
+else
+    warn "tkinter not importable (should have been installed via python3-tk in step 5 above). Only needed for the optional touchscreen GUI (gui.py); the terminal menu (run.py) doesn't need it. Install manually with: sudo apt-get install -y python3-tk"
+fi
+if [ -n "${DISPLAY:-}" ] || [ -e /dev/fb0 ] || [ -e /dev/dri/card0 ]; then
+    ok "A display environment appears to be present (DISPLAY set, or a framebuffer/DRM device found)"
+else
+    warn "No display environment detected (no \$DISPLAY, no /dev/fb0, no /dev/dri/card0). gui.py needs a monitor (and normally a desktop session) attached to the Pi -- it will not run over a plain SSH terminal. run.py's text menu works either way."
+fi
 
 # ---- 10. LCD (best-effort probe - optional hardware) ------------------------
 #
@@ -617,7 +613,7 @@ else
 fi
 
 if [ "$LCD_I2C_FOUND" -eq 0 ] && [ "$GPIO_PINS_OK" -eq 0 ]; then
-    fail "Neither an I2C LCD was detected nor were the direct-wired GPIO pins claimable. run.py will refuse to start the menu (LCD is mandatory hardware) until one of these paths works."
+    warn "Neither an I2C LCD was detected nor were the direct-wired GPIO pins claimable. The app still starts, but LCD output is unavailable."
 fi
 info "run.py's LCD_INTERFACE is set to 'auto' by default: it tries I2C first, then falls back to GPIO. See LCD_INTERFACE in run.py to force one or the other."
 info "Check it live via the app's menu: option 5 (System Status) -> LCD section -> Test LCD now?"
@@ -634,11 +630,7 @@ fi
 
 if [ "$FAIL" -gt 0 ]; then
     printf "\n${RED}${BOLD}Setup is NOT ready.${RESET} "
-    if [ "$AUTO_MODE" -eq 0 ]; then
-        printf "Fix the [FAIL] items above, or re-run with 'sudo ./setup.sh --auto' to fix them automatically.\n"
-    else
-        printf "Some items above still need manual attention (see messages above).\n"
-    fi
+    printf "Some items above still need manual attention (see messages above).\n"
     exit 1
 elif [ "$WARN" -gt 0 ]; then
     printf "\n${YELLOW}${BOLD}Setup looks mostly ready${RESET}, but review the [WARN] items above.\n"
