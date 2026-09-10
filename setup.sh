@@ -551,7 +551,7 @@ section "16x2 LCD (best-effort probe)"
 
 # Must match LCD_PIN_RS / LCD_PIN_E / LCD_PINS_DATA in run.py (BOARD numbering).
 LCD_PIN_RS_BOARD=32
-LCD_PIN_E_BOARD=26
+LCD_PIN_E_BOARD=29
 LCD_PINS_DATA_BOARD="13 15 18 16"
 # Must match LCD_I2C_COMMON_ADDRESSES in run.py.
 LCD_I2C_COMMON_ADDRESSES="0x27 0x3f"
