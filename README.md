@@ -19,7 +19,7 @@ A two-factor physical access control system for the Raspberry Pi. A user scans a
 | RFID reader | MFRC522 | SPI |
 | Fingerprint sensor | R307 / R307s | UART (`/dev/serial0`) |
 | Buzzer | Active or passive | GPIO (BOARD pin 12 by default) |
-| LCD | 16x2 character LCD — either an I2C backpack (PCF8574) or direct-wired GPIO | I2C (pins 3/5) or GPIO (BOARD pins 32/26/13/15/18/16 by default) — see "16x2 LCD" below |
+| LCD | 16x2 character LCD — either an I2C backpack (PCF8574) or direct-wired GPIO | I2C (pins 3/5) or GPIO (BOARD pins 32/29/13/15/18/16 by default) — see "16x2 LCD" below |
 
 **All four components above are required as of v1.5.** The system will not enter the menu or scanner mode unless every one initializes successfully at startup — see "Mandatory hardware check" below.
 
@@ -86,7 +86,7 @@ All numbers are **physical (BOARD) pin numbers**, to match the RFID reader and b
 | 3 | V0 (contrast) | — | Via resistor to GND rail — contrast adjustment |
 | 4 | RS | 32 | Any free GPIO |
 | 5 | R/W | — | Tie to GND rail (always write mode) |
-| 6 | E | 26 | Any free GPIO |
+| 6 | E | 29 | Any free GPIO |
 | 11 | D4 | 13 | Any free GPIO — **moved**, see note below |
 | 12 | D5 | 15 | Any free GPIO — **moved**, see note below |
 | 13 | D6 | 18 | Any free GPIO |
