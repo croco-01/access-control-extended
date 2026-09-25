@@ -85,6 +85,8 @@ class AccessControlGUI(tk.Tk):
         self.startup_cancel_event = threading.Event()
         self._startup_cancel_pending = False
         self.startup_active = True
+        self._workers = set()
+        self._closing = False
         self.container = tk.Frame(self, bg=BG)
         self.container.pack(fill="both", expand=True)
         self.current_frame = None
@@ -96,7 +98,40 @@ class AccessControlGUI(tk.Tk):
 
     def _signal_shutdown(self, signum, frame):
         """Signals run on Tk's main thread; schedule the UI work safely."""
-        self.after_idle(self.cancel_startup)
+        self.after_idle(self.shutdown)
+
+    def start_worker(self, target, *, args=()):
+        """Track a worker so hardware cleanup waits for it to finish."""
+        def run_target():
+            try:
+                target(*args)
+            finally:
+                self._workers.discard(threading.current_thread())
+
+        worker = threading.Thread(target=run_target, daemon=True)
+        self._workers.add(worker)
+        worker.start()
+        return worker
+
+    def stop_workers(self):
+        self.startup_cancel_event.set()
+        if self.current_frame is not None:
+            on_hide = getattr(self.current_frame, "on_hide", None)
+            if on_hide is not None:
+                on_hide()
+        for worker in tuple(self._workers):
+            worker.join()
+
+    def shutdown(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.startup_cancel_event.set()
+        if self.current_frame is not None:
+            on_hide = getattr(self.current_frame, "on_hide", None)
+            if on_hide is not None:
+                on_hide()
+        self.destroy()
 
     # ---- frame navigation ----
     def show_frame(self, frame_cls, **kwargs):
@@ -135,7 +170,7 @@ class AccessControlGUI(tk.Tk):
     def cancel_startup(self):
         """Request a clean exit while the splash worker is retrying hardware."""
         if not self.startup_active:
-            self.destroy()
+            self.shutdown()
             return
         if self._startup_cancel_pending:
             return
@@ -192,11 +227,12 @@ class SplashScreen(tk.Frame, QueueListener):
         big_button(self, "Exit", self.app.cancel_startup, danger=True).pack(
             fill="x", padx=20, pady=(20, 10), ipady=8)
 
-        self.worker = threading.Thread(target=self._run, daemon=True)
-        self.worker.start()
+        self.worker = self.app.start_worker(self._run)
 
     def _run(self):
         try:
+            if not run.acquire_database_lock():
+                raise RuntimeError("Another access-control instance is already running; database is locked.")
             run.load_database()
             run.decay_lockout_backoff()
 
@@ -205,15 +241,16 @@ class SplashScreen(tk.Frame, QueueListener):
 
             # Delegates entirely to run.py's shared initialize_hardware(): if
             # REQUIRE_ALL_HARDWARE is True this blocks/retries until every
-            # peripheral is online (same as the CLI's boot gate); if False it
+            # peripheral is online; if False it
             # initializes once and returns right away regardless of what's
             # missing. Either way, this is the ONLY place that decision is
             # made -- the GUI never hardcodes its own opinion about which
             # hardware is mandatory, so it can't drift out of sync with the
-            # CLI's behavior.
+            # behavior.
             started = run.initialize_hardware(
                 progress_cb=progress, cancel_event=self.app.startup_cancel_event)
-            self.post("hw_ready" if started else "hw_canceled")
+            canceled = self.app.startup_cancel_event.is_set()
+            self.post("hw_ready" if started and not canceled else "hw_canceled")
         except Exception as exc:
             run.log(f"Hardware startup failed unexpectedly: {exc}", "ERROR")
             self.post("hw_failed", error=str(exc))
@@ -233,7 +270,7 @@ class SplashScreen(tk.Frame, QueueListener):
             self.app.startup_active = False
             self.app.show_frame(Dashboard)
         elif etype == "hw_canceled":
-            self.app.destroy()
+            self.app.shutdown()
         elif etype == "hw_failed":
             self.app.startup_active = False
             self.status_label.config(text=f"Startup failed: {payload['error']}")
@@ -255,7 +292,7 @@ class ConfirmQuitScreen(tk.Frame, QueueListener):
         if self.app.startup_active:
             self.app.cancel_startup()
         else:
-            self.app.destroy()
+            self.app.shutdown()
 
 
 # ------------------------------------------------------------- dashboard --
@@ -380,8 +417,7 @@ class ScannerScreen(tk.Frame, QueueListener):
             self.toggle_btn.config(text="Stopping...", state="disabled")
         else:
             self.stop_event = threading.Event()
-            self.worker = threading.Thread(target=self._scan_loop, args=(self.stop_event,), daemon=True)
-            self.worker.start()
+            self.worker = self.app.start_worker(self._scan_loop, args=(self.stop_event,))
             self.toggle_btn.config(text="Stop Scanning", bg=RED, activebackground="#b8433e")
             self.set_state("ready", "Scan an RFID card")
 
@@ -390,10 +426,6 @@ class ScannerScreen(tk.Frame, QueueListener):
         self.stop_event.set()
 
     def _scan_loop(self, stop_event):
-        if not run.rfid_online:
-            self.post("scan_error", text="RFID reader is offline. Connect it, then restart the application.")
-            self.post("scan_stopped")
-            return
         if run.config["AUTHORIZED_UID"] is None:
             self.post("scan_error", text="No master RFID card is set. Set one from Master Card first.")
             self.post("scan_stopped")
@@ -401,9 +433,15 @@ class ScannerScreen(tk.Frame, QueueListener):
 
         run.decay_lockout_backoff()
         run.lcd_show("Access Control", "Ready")
-        run.led_blink()
 
         while not stop_event.is_set():
+            if not run.rfid_online:
+                run.recover_rfid_reader()
+                if not run.rfid_online:
+                    self.post("scan_error", text="RFID reader unavailable; retrying recovery.")
+                    stop_event.wait(run.RFID_RECOVERY_RETRY_SECONDS)
+                    continue
+            run.decay_lockout_backoff()
             remaining = run.current_lockout_remaining()
             if remaining > 0:
                 self.post("scan_locked", remaining=remaining)
@@ -412,8 +450,10 @@ class ScannerScreen(tk.Frame, QueueListener):
                 continue
 
             uid = run.read_rfid_nonblocking()
+            if stop_event.is_set():
+                break
             if uid is None:
-                time.sleep(run.RFID_SCAN_DELAY)
+                stop_event.wait(run.RFID_SCAN_DELAY)
                 continue
 
             run.new_scan_session()
@@ -437,12 +477,15 @@ class ScannerScreen(tk.Frame, QueueListener):
                     slot = name = None
                 else:
                     status, slot, name, _confidence = run.authenticate_fingerprint(cancel_event=stop_event)
+                if stop_event.is_set():
+                    break
 
                 if status == "SUCCESS":
                     schedule = run.config["user_schedules"].get(str(slot))
                     if not run.is_within_schedule(schedule):
-                        self.post("scan_denied", reason=f"{name} is outside allowed hours "
-                                       f"({schedule['start']}-{schedule['end']})")
+                        schedule_label = (f"{schedule.get('start', '?')}-{schedule.get('end', '?')}"
+                                          if isinstance(schedule, dict) else "invalid schedule")
+                        self.post("scan_denied", reason=f"{name} is outside allowed hours ({schedule_label})")
                         run.security_event("access_denied", reason="outside_schedule",
                                             user=name, slot=slot, schedule=schedule)
                         run.buzz_denied()
@@ -453,7 +496,6 @@ class ScannerScreen(tk.Frame, QueueListener):
                         run.security_event("access_granted", method="RFID + fingerprint",
                                            fingerprint_slot=slot, user=name)
                         run.buzz_granted()
-                        run.led_solid_on()
                         run.lcd_show("ACCESS GRANTED", name[:run.LCD_COLS])
                 elif status == "NO_MATCH":
                     self.post("scan_denied", reason="Fingerprint verification failed.")
@@ -490,12 +532,9 @@ class ScannerScreen(tk.Frame, QueueListener):
                                         lockout_count=run.config["lockout_state"]["lockout_count"])
                     run.lcd_show("LOCKED OUT", f"Wait {int(cooldown)}s")
 
-            time.sleep(1.5)
+            stop_event.wait(1.5)
             if run.current_lockout_remaining() == 0 and not stop_event.is_set():
                 run.lcd_show("Access Control", "Ready")
-                run.led_blink()
-
-        run.led_off()
         self.post("scan_stopped")
 
     def on_event(self, event):
@@ -587,6 +626,10 @@ class EnrollScreen(tk.Frame, QueueListener):
         if not name:
             self.status_label.config(text="Name cannot be empty.")
             return
+        if any(str(existing).strip().casefold() == name.casefold()
+               for existing in run.config["user_mappings"].values()):
+            self.status_label.config(text="That user name is already enrolled. Choose a unique name.")
+            return
         start = self.start_entry.get().strip()
         end = self.end_entry.get().strip()
         schedule = None
@@ -600,8 +643,8 @@ class EnrollScreen(tk.Frame, QueueListener):
         self.cancel_event = threading.Event()
         self.start_btn.config(state="disabled")
         self.cancel_btn.config(state="normal", bg=RED, activebackground="#b8433e")
-        self.worker = threading.Thread(target=self._enroll, args=(name, schedule, self.cancel_event), daemon=True)
-        self.worker.start()
+        self.worker = self.app.start_worker(
+            self._enroll, args=(name, schedule, self.cancel_event))
 
     def cancel(self):
         self.cancel_event.set()
@@ -611,12 +654,19 @@ class EnrollScreen(tk.Frame, QueueListener):
         """Navigation has the same cancellation semantics as Cancel."""
         self.cancel_event.set()
 
+    @run.serialized_fingerprint
     def _enroll(self, name, schedule, cancel_event):
         def status(text):
             self.post("enroll_status", text=text)
 
         if cancel_event.is_set():
             self.post("enroll_done", ok=False, text="Canceled.")
+            return
+
+        if any(str(existing).strip().casefold() == name.casefold()
+               for existing in run.config["user_mappings"].values()):
+            self.post("enroll_done", ok=False,
+                      text="That user name is already enrolled. Choose a unique name.")
             return
 
         slot = run.find_next_free_slot()
@@ -708,8 +758,13 @@ class EnrollScreen(tk.Frame, QueueListener):
                 return
 
             if cancel_event.is_set():
-                self.post("enroll_done", ok=False, text="Canceled.")
+                rollback_result = run.finger.delete_model(slot)
+                message = "Canceled."
+                if rollback_result != run.adafruit_fingerprint.OK:
+                    message += f" Sensor slot #{slot} could not be cleared; remove it manually."
+                self.post("enroll_done", ok=False, text=message)
                 return
+
             run.config["user_mappings"][str(slot)] = name
             if schedule is not None:
                 run.config["user_schedules"][str(slot)] = schedule
@@ -717,8 +772,16 @@ class EnrollScreen(tk.Frame, QueueListener):
                 run.config["user_schedules"].pop(str(slot), None)
 
             if not run.save_database():
+                run.config["user_mappings"].pop(str(slot), None)
+                run.config["user_schedules"].pop(str(slot), None)
+                rollback_ok = run._delete_sensor_template(slot)
+                run.security_event("enrollment_database_save_failed", user=name, slot=slot,
+                                   sensor_rollback_succeeded=rollback_ok)
+                message = ("Enrollment was rolled back because the database could not be saved."
+                           if rollback_ok else
+                           f"DATABASE SAVE FAILED: slot #{slot} remains on the sensor; delete it manually.")
                 self.post("enroll_done", ok=False,
-                              text=f"Stored in sensor slot #{slot}, but database save failed.")
+                              text=message)
                 return
 
             run.security_event("fingerprint_enrolled", user=name, slot=slot, schedule=schedule)
@@ -850,27 +913,48 @@ class ConfirmDeleteScreen(tk.Frame, QueueListener):
         tk.Label(self, text="This removes the fingerprint from the sensor and the database. "
                              "This cannot be undone.", font=FONT_NORMAL, bg=BG, fg=MUTED,
                  wraplength=700, justify="center").pack(pady=(0, 30))
+        self.status_label = tk.Label(self, text="", font=FONT_SMALL, bg=BG, fg=RED,
+                                     wraplength=700, justify="center")
+        self.status_label.pack(pady=(0, 12))
         row = tk.Frame(self, bg=BG)
         row.pack()
         big_button(row, "Cancel", lambda: app.show_frame(ManageUsersScreen), muted=True).pack(side="left", padx=10)
-        big_button(row, "Delete", self._delete, danger=True).pack(side="left", padx=10)
+        self.delete_btn = big_button(row, "Delete", self._delete, danger=True)
+        self.delete_btn.pack(side="left", padx=10)
+        self.retry_btn = big_button(row, "Retry Save", self._retry_save, muted=True, state="disabled")
+        self.retry_btn.pack(side="left", padx=10)
 
     def _delete(self):
         if not run.finger_sensor_online:
-            self.app.show_frame(ManageUsersScreen)
+            self.status_label.config(text="Fingerprint sensor is offline; deletion was not attempted.")
             return
         try:
-            result = run.finger.delete_model(int(self.slot))
+            with run.fingerprint_lock:
+                result = run.finger.delete_model(int(self.slot))
             if result != run.adafruit_fingerprint.OK:
-                self.app.show_frame(ManageUsersScreen)
+                self.status_label.config(text=f"Sensor deletion failed: {run.result_name(result)}")
                 return
             del run.config["user_mappings"][self.slot]
             run.config["user_schedules"].pop(self.slot, None)
-            run.save_database()
+            if not run.save_database():
+                self.status_label.config(
+                    text="The sensor template was deleted, but the database could not be saved. "
+                         "Retry saving before restarting.")
+                self.delete_btn.config(state="disabled")
+                self.retry_btn.config(state="normal")
+                return
             run.security_event("fingerprint_deleted", user=self.name, slot=int(self.slot))
-        except (OSError, RuntimeError):
-            pass
+        except (OSError, RuntimeError) as e:
+            self.status_label.config(text=f"Deletion failed: {e}")
+            return
         self.app.show_frame(ManageUsersScreen)
+
+    def _retry_save(self):
+        if run.save_database():
+            run.security_event("fingerprint_deleted", user=self.name, slot=int(self.slot))
+            self.app.show_frame(ManageUsersScreen)
+        else:
+            self.status_label.config(text="Database save still failed. Do not restart yet.")
 
 
 # ------------------------------------------------------------ master card -
@@ -908,18 +992,13 @@ class MasterCardScreen(tk.Frame, QueueListener):
         self.cancel_btn.pack(side="left", expand=True, fill="x", ipady=10)
 
     def start(self):
-        if not run.rfid_online:
-            self.status_label.config(
-                text="RFID reader is offline. Connect it, then restart the application.",
-                bg=RED, fg="white")
-            return
         admin_name = self.name_entry.get().strip() or None
         self.cancel_event = threading.Event()
         self.start_btn.config(state="disabled")
         self.cancel_btn.config(state="normal", bg=RED, activebackground="#b8433e")
         self.status_label.config(text="Scan the new master RFID card now...", bg=PANEL_BG, fg=FG)
-        self.worker = threading.Thread(target=self._scan, args=(admin_name, self.cancel_event), daemon=True)
-        self.worker.start()
+        self.worker = self.app.start_worker(
+            self._scan, args=(admin_name, self.cancel_event))
 
     def cancel(self):
         self.cancel_event.set()
@@ -937,7 +1016,7 @@ class MasterCardScreen(tk.Frame, QueueListener):
                 return
             uid = run.read_rfid_nonblocking()
             if uid is None:
-                time.sleep(0.1)
+                cancel_event.wait(0.1)
                 continue
             if cancel_event.is_set():
                 self.post("master_done", ok=False, text="Canceled.")
@@ -988,7 +1067,6 @@ class StatusScreen(tk.Frame, QueueListener):
         btn_row.pack(fill="x", padx=20, pady=(0, 20))
         big_button(btn_row, "Refresh", self.refresh, muted=True).pack(side="left", expand=True, fill="x", padx=(0, 6))
         big_button(btn_row, "Test Buzzer", self.test_buzzer, muted=True).pack(side="left", expand=True, fill="x", padx=6)
-        big_button(btn_row, "Test LED", self.test_led, muted=True).pack(side="left", expand=True, fill="x", padx=6)
         big_button(btn_row, "Test LCD", self.test_lcd, muted=True).pack(side="left", expand=True, fill="x", padx=(6, 0))
 
         self.refresh()
@@ -1002,7 +1080,6 @@ class StatusScreen(tk.Frame, QueueListener):
         lines.append(f"Fingerprint: {'ONLINE' if s['fingerprint_sensor']['online'] else 'OFFLINE'}  "
                       f"usage {s['fingerprint_sensor']['local_usage']}/{s['fingerprint_sensor']['capacity']}")
         lines.append(f"Buzzer: {'ONLINE' if s['buzzer']['online'] else 'OFFLINE'}  (pin {s['buzzer']['pin']})")
-        lines.append(f"LED: {'ONLINE' if s['led']['online'] else 'OFFLINE'}  (pin {s['led']['pin']})")
         lcd = s["lcd"]
         active = f", active: {lcd['active']['interface']}" if lcd["active"] else ""
         lines.append(f"LCD: {'ONLINE' if lcd['online'] else 'OFFLINE'}  "
@@ -1032,9 +1109,6 @@ class StatusScreen(tk.Frame, QueueListener):
 
     def test_buzzer(self):
         run.test_buzzer()
-
-    def test_led(self):
-        run.test_led()
 
     def test_lcd(self):
         if not run.test_lcd():
@@ -1079,4 +1153,6 @@ if __name__ == "__main__":
     try:
         app.mainloop()
     finally:
+        app.stop_workers()
         run.cleanup()
+        run.release_database_lock()
