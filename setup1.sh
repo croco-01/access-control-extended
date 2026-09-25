@@ -25,7 +25,8 @@ info() { printf "         %s\n" "$1"; }
 section() { printf "\n${BOLD}%s${RESET}\n" "$1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_FILE="$SCRIPT_DIR/run.py"
+PROJECT_FILE="$SCRIPT_DIR/gui.py"
+BACKEND_FILE="$SCRIPT_DIR/run.py"
 
 # Setup applies available fixes by default. No command-line flag is needed.
 
@@ -199,8 +200,10 @@ if [ "$SPI_OK" -eq 0 ] || [ "$UART_OK" -eq 0 ] || [ "$I2C_OK" -eq 0 ]; then
             fi
             if [ "$UART_OK" -eq 0 ]; then
                 as_root raspi-config nonint do_serial_hw 0   # enable UART hardware
+                UART_HW_STATUS=$?
                 as_root raspi-config nonint do_serial_cons 1 # disable login shell over serial
-                if [ $? -eq 0 ]; then
+                UART_CONSOLE_STATUS=$?
+                if [ "$UART_HW_STATUS" -eq 0 ] && [ "$UART_CONSOLE_STATUS" -eq 0 ]; then
                     ok "UART hardware enabled and serial console disabled via raspi-config (takes effect after reboot)"
                     NEEDS_REBOOT=1
                 else
@@ -255,39 +258,6 @@ if command -v apt-get >/dev/null 2>&1; then
     fi
 else
     warn "apt-get not found. This project targets Raspberry Pi OS (Debian-based); if you're on a different distro, install equivalent packages manually: $APT_PACKAGES"
-fi
-
-# ---- 3b. Remove PEP 668 EXTERNALLY-MANAGED marker -------------------------
-#
-# Recent Debian/Pi OS ship python3-pip with an EXTERNALLY-MANAGED marker
-# file that blocks plain `pip install` system-wide (PEP 668). We already
-# pass --break-system-packages to pip below, which is normally enough on
-# its own; removing the marker here too is a belt-and-suspenders step some
-# environments still need. This script applies the change by default, and it
-# change, and made safe to re-run (glob may match nothing / multiple
-# python3.X dirs).
-
-section "Python Package Policy (PEP 668)"
-
-EXTERNALLY_MANAGED_FILES=(/usr/lib/python3*/EXTERNALLY-MANAGED)
-FOUND_MARKER=0
-for f in "${EXTERNALLY_MANAGED_FILES[@]}"; do
-    [ -e "$f" ] || continue
-    FOUND_MARKER=1
-    warn "Found PEP 668 marker: $f"
-    if should_fix; then
-        as_root rm -f "$f"
-        if [ $? -eq 0 ]; then
-            ok "Removed $f"
-        else
-            fail "Could not remove $f. Try manually: sudo rm $f"
-        fi
-    else
-        info "Skipped. Remove manually: sudo rm $f"
-    fi
-done
-if [ "$FOUND_MARKER" -eq 0 ]; then
-    ok "No EXTERNALLY-MANAGED marker found (pip installs unrestricted, or already removed)"
 fi
 
 # ---- 4. GPIO permissions --------------------------------------------------
@@ -384,8 +354,8 @@ if [ "${#MISSING_PIP[@]}" -gt 0 ]; then
         # Always install as the real login user, never as root, even when
         # this script itself is run via sudo. This keeps packages in that
         # user's own site-packages (~/.local/...), which is where their
-        # `python3 run.py` will actually look.
-        run_as_real_user pip install "${MISSING_PIP[@]}" --break-system-packages
+        # `python3 gui.py` will actually look.
+        run_as_real_user pip install --user "${MISSING_PIP[@]}" --break-system-packages
         if [ $? -eq 0 ]; then
             ok "pip install command completed: ${MISSING_PIP[*]}"
             # Re-verify each module individually, as the same real user,
@@ -403,7 +373,7 @@ if [ "${#MISSING_PIP[@]}" -gt 0 ]; then
             fail "pip install failed. Check the output above and try running it manually."
         fi
     else
-        info "Skipped. Install manually: pip install ${MISSING_PIP[*]} --break-system-packages"
+        info "Skipped. Install manually: pip install --user ${MISSING_PIP[*]} --break-system-packages"
     fi
 fi
 
@@ -412,21 +382,31 @@ fi
 section "Project Files"
 
 if [ -f "$PROJECT_FILE" ]; then
-    ok "Main script found: $PROJECT_FILE"
-    if python3 -m py_compile "$PROJECT_FILE" 2>/tmp/pycompile_err.txt; then
-        ok "Main script compiles without syntax errors"
+    ok "GUI entry point found: $PROJECT_FILE"
+    if [ -f "$BACKEND_FILE" ]; then
+        if python3 - "$PROJECT_FILE" "$BACKEND_FILE" <<'PYEOF' 2>/tmp/pycompile_err.txt
+import ast
+import pathlib
+import sys
+for name in sys.argv[1:]:
+    ast.parse(pathlib.Path(name).read_text(encoding="utf-8"), filename=name)
+PYEOF
+        then
+            ok "GUI and shared backend have no Python syntax errors"
+        else
+            fail "GUI or shared backend has a Python syntax error:"
+            sed 's/^/         /' /tmp/pycompile_err.txt
+        fi
     else
-        fail "Main script has a syntax error:"
-        sed 's/^/         /' /tmp/pycompile_err.txt
+        fail "Shared backend not found at $BACKEND_FILE."
     fi
     rm -f /tmp/pycompile_err.txt
-    rm -rf "$SCRIPT_DIR/__pycache__" 2>/dev/null
 else
-    fail "Main script not found at $PROJECT_FILE (expected run.py alongside setup.sh)."
+    fail "GUI entry point not found at $PROJECT_FILE (expected gui.py alongside setup.sh)."
 fi
 
 PROJECT_DIR="$(dirname "$PROJECT_FILE")"
-if [ -w "$PROJECT_DIR" ]; then
+if run_as_real_user test -w "$PROJECT_DIR"; then
     ok "Project directory is writable ($PROJECT_DIR) - database and logs can be saved here"
 else
     fail "Project directory is NOT writable ($PROJECT_DIR). The app needs to write fingerprint_database.json and access_log.jsonl here."
@@ -434,13 +414,13 @@ fi
 
 LOGS_DIR="$PROJECT_DIR/logs"
 if [ -d "$LOGS_DIR" ]; then
-    if [ -w "$LOGS_DIR" ]; then
+    if run_as_real_user test -w "$LOGS_DIR"; then
         ok "Daily log directory exists and is writable ($LOGS_DIR)"
     else
         fail "Daily log directory exists but is NOT writable ($LOGS_DIR)."
     fi
 else
-    info "Daily log directory ($LOGS_DIR) doesn't exist yet - run.py creates it automatically on first run."
+    info "Daily log directory ($LOGS_DIR) doesn't exist yet - the app creates it automatically on first run."
 fi
 
 # ---- 7. RFID reader probe (best-effort, non-invasive) ----------------------
@@ -523,59 +503,27 @@ else
     warn "RPi.GPIO not importable; cannot probe the buzzer pin."
 fi
 info "The buzzer is optional; audio feedback is unavailable while it is offline."
-info "Check it live via the app's menu: option 5 (System Status) -> Buzzer section -> Test buzzer now?"
+info "Check buzzer health and run its test from the GUI's System Status screen."
 
-# ---- 9a. LED (best-effort probe - optional hardware) -----------------------
+# ---- 9b. GUI display -------------------------------------------------------
 
-section "LED (best-effort probe)"
-
-LED_PIN_BOARD=11   # must match LED_PIN in run.py (BOARD numbering)
-
-if run_as_real_user python3 -c "import RPi.GPIO" >/dev/null 2>&1; then
-    run_as_real_user python3 - <<PYEOF 2>/dev/null
-import sys
-try:
-    import RPi.GPIO as GPIO
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BOARD)
-    GPIO.setup($LED_PIN_BOARD, GPIO.OUT)
-    GPIO.output($LED_PIN_BOARD, GPIO.LOW)
-    GPIO.cleanup($LED_PIN_BOARD)
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-PYEOF
-    if [ $? -eq 0 ]; then
-        ok "GPIO pin $LED_PIN_BOARD (BOARD) is free and claimable for the LED"
-        info "This confirms the pin is usable, not that an LED is physically connected."
-    else
-        warn "Could not claim GPIO pin $LED_PIN_BOARD (BOARD) for the LED. It may be in use by another process/overlay, or wiring may be off."
-    fi
-else
-    warn "RPi.GPIO not importable; cannot probe the LED pin."
-fi
-info "The LED is optional; it's a status indicator only (blinks while scanning, solid on when access is granted) and nothing else depends on it."
-info "Check it live via the app's menu: option 5 (System Status) -> LED section -> Test LED now?"
-
-# ---- 9b. Touchscreen GUI (optional - only needed for gui.py) --------------
-
-section "Touchscreen GUI (gui.py, optional)"
+section "GUI display (required to use the application)"
 
 if run_as_real_user python3 -c "import tkinter" >/dev/null 2>&1; then
-    ok "tkinter importable (needed only if you run gui.py, not run.py)"
+    ok "tkinter importable"
 else
-    warn "tkinter not importable (should have been installed via python3-tk in step 5 above). Only needed for the optional touchscreen GUI (gui.py); the terminal menu (run.py) doesn't need it. Install manually with: sudo apt-get install -y python3-tk"
+    fail "tkinter not importable (should have been installed via python3-tk). Install manually with: sudo apt-get install -y python3-tk"
 fi
 if [ -n "${DISPLAY:-}" ] || [ -e /dev/fb0 ] || [ -e /dev/dri/card0 ]; then
     ok "A display environment appears to be present (DISPLAY set, or a framebuffer/DRM device found)"
 else
-    warn "No display environment detected (no \$DISPLAY, no /dev/fb0, no /dev/dri/card0). gui.py needs a monitor (and normally a desktop session) attached to the Pi -- it will not run over a plain SSH terminal. run.py's text menu works either way."
+    warn "No display environment detected (no \$DISPLAY, no /dev/fb0, no /dev/dri/card0). The GUI needs a monitor and desktop session; it cannot run in a plain SSH terminal."
 fi
 
 # ---- 10. LCD (best-effort probe - optional hardware) ------------------------
 #
-# run.py supports two LCD wiring styles (LCD_INTERFACE = "auto" by default,
-# which tries I2C first, then falls back to GPIO). This probe checks
+# run.py supports two LCD wiring styles (LCD_INTERFACE = "gpio" by default;
+# set it to "auto" to try I2C first, then fall back to GPIO). This probe checks
 # BOTH paths and reports on whichever one(s) look usable, since we don't
 # know ahead of time which hardware is actually connected.
 
@@ -647,8 +595,8 @@ fi
 if [ "$LCD_I2C_FOUND" -eq 0 ] && [ "$GPIO_PINS_OK" -eq 0 ]; then
     warn "Neither an I2C LCD was detected nor were the direct-wired GPIO pins claimable. The app still starts, but LCD output is unavailable."
 fi
-info "run.py's LCD_INTERFACE is set to 'auto' by default: it tries I2C first, then falls back to GPIO. See LCD_INTERFACE in run.py to force one or the other."
-info "Check it live via the app's menu: option 5 (System Status) -> LCD section -> Test LCD now?"
+info "run.py's LCD_INTERFACE is set to 'gpio' by default. Set it to 'auto' to try I2C first, then fall back to GPIO, or 'i2c' to force I2C."
+info "Check LCD health and run its test from the GUI's System Status screen."
 
 # ---- Summary ----------------------------------------------------------------
 
@@ -668,6 +616,6 @@ elif [ "$WARN" -gt 0 ]; then
     printf "\n${YELLOW}${BOLD}Setup looks mostly ready${RESET}, but review the [WARN] items above.\n"
     exit 0
 else
-    printf "\n${GREEN}${BOLD}Everything checks out. You're good to run: python3 %s${RESET}\n" "$PROJECT_FILE"
+    printf "\n${GREEN}${BOLD}Everything checks out. Start the GUI with: python3 %s${RESET}\n" "$PROJECT_FILE"
     exit 0
 fi
