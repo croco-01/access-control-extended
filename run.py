@@ -7,6 +7,8 @@ import signal
 import threading
 import uuid
 import copy
+import fcntl
+from functools import wraps
 from datetime import datetime, time as dtime
 
 import serial
@@ -22,6 +24,7 @@ VERSION = "1.5"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "fingerprint_database.json")
 DB_BACKUP = DB_FILE + ".bak"
+DB_LOCK_FILE = DB_FILE + ".lock"
 SECURITY_LOG = os.path.join(BASE_DIR, "access_log.jsonl")
 
 # Peripherals are optional by default so the UI can be tested on a machine
@@ -45,6 +48,7 @@ DEFAULT_SCHEDULE = None  # e.g. {"start": "09:00", "end": "18:00"}
 LOCKOUT_BACKOFF_MULTIPLIER = 2
 LOCKOUT_MAX_SECONDS = 300  # cap the backoff so a legitimate user is never
                             # locked out for an unreasonable length of time
+LOCKOUT_BACKOFF_DECAY_SECONDS = 24 * 60 * 60
 
 
 FINGERPRINT_UART = "/dev/serial0"
@@ -56,6 +60,7 @@ COMMUNICATION_ERROR_THRESHOLD = 2
 MAX_FINGERPRINT_SLOTS = 162  # R307/R307s hardware template capacity
 
 RFID_SCAN_DELAY = 0.15
+RFID_RECOVERY_RETRY_SECONDS = 5
 MAX_FINGERPRINT_ATTEMPTS = 3
 LOCKOUT_THRESHOLD = 3       # consecutive denied attempts before lockout
 LOCKOUT_SECONDS = 10
@@ -83,27 +88,34 @@ HARDWARE_FAILURE_PATTERN = (
 #   - "gpio": direct-wired, 6 GPIO lines (RS, E, D4-D7), no backpack.
 #   - "i2c":  4-wire I2C backpack (PCF8574/PCF8574A), typical address
 #             0x27 or 0x3F.
-# LCD_INTERFACE = "auto" tries I2C first (a quick, non-destructive bus
-# probe) and falls back to GPIO if nothing answers -- so the same code
-# and the same config file work with either physical display without
-# editing anything, as long as the GPIO pins below match your wiring
-# for the GPIO case, or LCD_I2C_ADDRESS matches your backpack for the
-# I2C case (or is left None to auto-scan common addresses).
+# GPIO is the default because this installation uses a direct-wired display.
+# Set LCD_INTERFACE to "i2c" for an I2C backpack, or "auto" to probe I2C
+# first and then fall back to GPIO. A GPIO LCD cannot be electrically
+# detected while its R/W pin is tied to ground; successful initialization
+# only proves the GPIO driver could be configured.
 LCD_ENABLED = True
-LCD_INTERFACE = "auto"   # "auto" | "gpio" | "i2c"
+LCD_INTERFACE = "gpio"   # "gpio" | "i2c" | "auto"
 
 # --- GPIO (direct-wired) settings ---
 # Pin numbers below are BOARD (physical) numbers, to match every other
 # piece of hardware in this project -- mfrc522 forces GPIO.setmode
 # (GPIO.BOARD) internally, and the buzzer uses BOARD too. RPi.GPIO only
 # allows ONE numbering mode per process, so everything has to agree.
-# RS, E, D6, D7 match the original wiring plan (BCM12/BOARD32,
-# BCM7/BOARD29, BCM24/BOARD18, BCM23/BOARD16). D4 and D5 were MOVED from
-# their original pins (BOARD24, BOARD22) to BOARD13 and BOARD15, because
-# 24 and 22 are already used by the RFID reader (SDA/CS and RST). If you
-# rewire the LCD to different physical pins, update the map below to match.
+# RS, D6, D7 match the original wiring plan (BCM12/BOARD32, BCM24/BOARD18,
+# BCM23/BOARD16). D4, D5, and E were all MOVED from their original pins:
+#   - D4/D5: from BOARD24/BOARD22 to BOARD13/BOARD15, because 24 and 22
+#     are already used by the RFID reader (SDA/CS and RST).
+#   - E: from BOARD26 to BOARD29, because BOARD26 is BCM7 -- SPI0's CE1
+#     line. Enabling SPI (needed for the RFID reader) via the standard
+#     2-chip-select overlay reserves BOTH CE0 (BOARD24) and CE1 (BOARD26)
+#     for the SPI peripheral's pinmux function, even though the RFID
+#     reader only ever opens CE0. BOARD26 is therefore not reliably
+#     usable as a plain GPIO once SPI is on, regardless of whether
+#     anything actually talks to CE1.
+# If you rewire the LCD to different physical pins, update the map below
+# to match.
 LCD_PIN_RS = 32                   # BOARD 32 (BCM12)
-LCD_PIN_E = 29                    # BOARD 29 (BCM7)
+LCD_PIN_E = 29                    # BOARD 29 (BCM5) -- moved off BOARD26/CE1, see above
 LCD_PINS_DATA = [13, 15, 18, 16]  # D4, D5, D6, D7 (D4/D5 moved off RFID pins)
 
 # --- I2C (backpack) settings ---
@@ -171,12 +183,21 @@ def security_event(event, **data):
               "event": event, "session": _current_session_id, **data}
     line = json.dumps(record) + "\n"
     try:
-        with open(_today_log_path(), "a", encoding="utf-8") as f:
+        log_path = _today_log_path()
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(line)
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
         # Best-effort mirror to the stable SECURITY_LOG filename too, so
         # anything that watches a fixed path (e.g. `tail -f`) keeps working.
         with open(SECURITY_LOG, "a", encoding="utf-8") as f:
             f.write(line)
+        try:
+            os.chmod(SECURITY_LOG, 0o600)
+        except OSError:
+            pass
     except OSError as e:
         log(f"Could not write security log: {e}", "ERROR")
 
@@ -219,9 +240,43 @@ DEFAULT_CONFIG = {
         "lockout_count": 0,       # how many times lockout has triggered,
                                    # drives the exponential backoff
         "locked_until": 0,        # unix timestamp, 0 = not locked
+        "last_lockout": 0,
     },
 }
 config = copy.deepcopy(DEFAULT_CONFIG)
+_database_lock_handle = None
+
+
+def acquire_database_lock():
+    """Prevent two app instances from overwriting each other's database.
+
+    flock locks are released automatically if this process exits or crashes,
+    so the lock file itself is harmless and never needs manual deletion.
+    """
+    global _database_lock_handle
+    if _database_lock_handle is not None:
+        return True
+    try:
+        handle = open(DB_LOCK_FILE, "a", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if 'handle' in locals():
+            handle.close()
+        return False
+    _database_lock_handle = handle
+    return True
+
+
+def release_database_lock():
+    global _database_lock_handle
+    if _database_lock_handle is None:
+        return
+    try:
+        fcntl.flock(_database_lock_handle.fileno(), fcntl.LOCK_UN)
+        _database_lock_handle.close()
+    except OSError:
+        pass
+    _database_lock_handle = None
 
 
 def normalize_config():
@@ -232,14 +287,52 @@ def normalize_config():
     config.setdefault("admin_name", None)
     if not isinstance(config.get("user_mappings"), dict):
         config["user_mappings"] = {}
+    else:
+        # Drop corrupt keys so sorted(..., key=int) callers never crash.
+        # Valid keys are "1".."162" with a non-empty string name.
+        cleaned = {}
+        for k, v in config["user_mappings"].items():
+            try:
+                n = int(k)
+            except (ValueError, TypeError):
+                log(f"Dropping corrupt user mapping key {k!r}.", "WARNING")
+                continue
+            if not 1 <= n <= MAX_FINGERPRINT_SLOTS:
+                log(f"Dropping out-of-range user mapping slot {k!r}.", "WARNING")
+                continue
+            if not isinstance(v, str) or not v.strip():
+                log(f"Dropping corrupt user mapping for slot {k!r}.", "WARNING")
+                continue
+            cleaned[str(n)] = v
+        config["user_mappings"] = cleaned
     if not isinstance(config.get("user_schedules"), dict):
         config["user_schedules"] = {}
+    else:
+        # Drop schedules without a matching user; validate the rest.
+        for k in list(config["user_schedules"].keys()):
+            if k not in config["user_mappings"]:
+                config["user_schedules"].pop(k, None)
+                continue
+            sched = config["user_schedules"][k]
+            if sched is None:
+                config["user_schedules"].pop(k, None)
+                continue
+            valid, err = validate_schedule(sched)
+            if not valid:
+                log(f"Dropping invalid schedule for slot {k!r}: {err}", "WARNING")
+                config["user_schedules"].pop(k, None)
     if not isinstance(config.get("lockout_state"), dict):
         config["lockout_state"] = copy.deepcopy(DEFAULT_CONFIG["lockout_state"])
     else:
         config["lockout_state"].setdefault("consecutive_failures", 0)
         config["lockout_state"].setdefault("lockout_count", 0)
         config["lockout_state"].setdefault("locked_until", 0)
+        state = config["lockout_state"]
+        # Older databases have no last_lockout field. Start their decay
+        # window now so an existing backoff is preserved for another day.
+        state.setdefault("last_lockout", time.time() if state["lockout_count"] else 0)
+        if not isinstance(state["last_lockout"], (int, float)):
+            state["last_lockout"] = time.time() if state["lockout_count"] else 0
 
 
 def load_database():
@@ -282,7 +375,17 @@ def save_database():
             json.dump(config, f, indent=4, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
+        try:
+            os.chmod(temp_file, 0o600)
+        except OSError:
+            pass
         os.replace(temp_file, DB_FILE)
+        try:
+            os.chmod(DB_FILE, 0o600)
+            if os.path.exists(DB_BACKUP):
+                os.chmod(DB_BACKUP, 0o600)
+        except OSError:
+            pass
         return True
     except OSError as e:
         log(f"Database save failed: {e}", "ERROR")
@@ -301,10 +404,32 @@ finger = None
 reader = None
 finger_sensor_online = False
 rfid_online = False
+fingerprint_lock = threading.RLock()
+rfid_lock = threading.RLock()
+_last_rfid_recovery_attempt = 0.0
+
+
+def serialized_fingerprint(fn):
+    """Keep each multi-command sensor transaction exclusive on the UART."""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with fingerprint_lock:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def serialized_rfid(fn):
+    """Serialize accesses and recovery for the shared MFRC522 reader."""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with rfid_lock:
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 # ---------------------------------------------------- fingerprint sensor ---
 
+@serialized_fingerprint
 def initialize_fingerprint():
     """Open the UART and bring up the R307/R307s. Call once at startup,
     and again only via recover_fingerprint_sensor() after a comms error."""
@@ -336,6 +461,7 @@ def initialize_fingerprint():
         return False
 
 
+@serialized_fingerprint
 def recover_fingerprint_sensor():
     """Only called after an actual UART communication error, never after
     a normal NOFINGER/NOTFOUND result."""
@@ -416,6 +542,7 @@ def wait_for_finger(timeout=FINGER_WAIT_TIMEOUT, cancel_event=None):
     return False
 
 
+@serialized_fingerprint
 def get_sensor_template_count():
     if not finger_sensor_online or finger is None:
         return None
@@ -429,7 +556,7 @@ def get_sensor_template_count():
 
 # ------------------------------------------------------------- fp auth -----
 
-def authenticate_fingerprint(cancel_event=None):
+def _authenticate_fingerprint_unlocked(cancel_event=None):
     """Returns (status, slot, name, confidence).
     status in SUCCESS / NO_MATCH / TIMEOUT / COMMUNICATION_ERROR / SHUTDOWN.
     cancel_event is an optional threading.Event a caller (e.g. a GUI Stop
@@ -441,7 +568,12 @@ def authenticate_fingerprint(cancel_event=None):
         return shutdown_requested or (cancel_event is not None and cancel_event.is_set())
 
     print(f"\nFingerprint authentication (max {MAX_FINGERPRINT_ATTEMPTS} attempts)")
-    time.sleep(FINGERPRINT_SETTLE_TIME)
+    if cancel_event is None:
+        time.sleep(FINGERPRINT_SETTLE_TIME)
+    elif cancel_event.wait(FINGERPRINT_SETTLE_TIME):
+        return "SHUTDOWN", None, None, None
+    if shutdown_requested:
+        return "SHUTDOWN", None, None, None
 
     if not wait_for_no_finger(cancel_event=cancel_event):
         log("Could not confirm sensor is clear.", "WARNING")
@@ -472,9 +604,13 @@ def authenticate_fingerprint(cancel_event=None):
         try:
             if finger.image_2_tz(1) != adafruit_fingerprint.OK:
                 continue
+            if canceled():
+                return "SHUTDOWN", None, None, None
 
             print("Searching database...")
             match = finger.finger_fast_search()
+            if canceled():
+                return "SHUTDOWN", None, None, None
 
             if match == adafruit_fingerprint.OK:
                 slot, confidence = finger.finger_id, finger.confidence
@@ -505,8 +641,15 @@ def authenticate_fingerprint(cancel_event=None):
     return "NO_MATCH", None, None, None
 
 
+def authenticate_fingerprint(cancel_event=None):
+    """Authenticate while exclusively owning the fingerprint UART."""
+    with fingerprint_lock:
+        return _authenticate_fingerprint_unlocked(cancel_event=cancel_event)
+
+
 # ------------------------------------------------------------------ RFID ---
 
+@serialized_rfid
 def initialize_rfid():
     global reader, rfid_online
     log("Initializing RFID reader...")
@@ -523,9 +666,23 @@ def initialize_rfid():
         return False
 
 
+@serialized_rfid
+def recover_rfid_reader():
+    """Rate-limited recovery after a transient RFID/SPI read failure."""
+    global _last_rfid_recovery_attempt
+    now = time.monotonic()
+    if now - _last_rfid_recovery_attempt < RFID_RECOVERY_RETRY_SECONDS:
+        return False
+    _last_rfid_recovery_attempt = now
+    log("Attempting RFID reader recovery...", "WARNING")
+    return initialize_rfid()
+
+
+@serialized_rfid
 def read_rfid_nonblocking():
     global rfid_online
     if not rfid_online or reader is None:
+        recover_rfid_reader()
         return None
     try:
         uid, _text = reader.read_no_block()
@@ -678,6 +835,7 @@ lcd_online = False
 lcd = None
 lcd_interface_used = None  # "gpio" or "i2c", set once init succeeds -- purely
                             # informational, shown in status/logs
+lcd_last_error = None       # latest initialization/write error for diagnostics
 _lcd_lock = threading.Lock()
 
 
@@ -757,18 +915,19 @@ def _init_lcd_gpio():
     lcd.clear()
     lcd_interface_used = "gpio"
     log(f"LCD initialized over GPIO ({LCD_COLS}x{LCD_ROWS}, BOARD pins "
-        f"RS={LCD_PIN_RS} E={LCD_PIN_E} D4-D7={LCD_PINS_DATA}).")
+        f"RS={LCD_PIN_RS} E={LCD_PIN_E} D4-D7={LCD_PINS_DATA}; "
+        "write-only, confirm the test message visually).")
 
 
 def initialize_lcd():
     """Brings up the LCD using whichever interface LCD_INTERFACE selects.
-    "auto" tries I2C first (cheap to probe, and the far more common
-    hobbyist wiring these days) then falls back to GPIO -- so the exact
-    same call works unmodified whether an I2C backpack or a direct-wired
-    display is actually attached."""
-    global lcd_online, lcd, lcd_interface_used
+    "gpio" is the default for the direct-wired display in this project.
+    "i2c" selects an I2C backpack, while "auto" tries I2C first and
+    falls back to GPIO."""
+    global lcd_online, lcd, lcd_interface_used, lcd_last_error
     if not LCD_ENABLED:
         lcd_online = False
+        lcd_last_error = "LCD is disabled in configuration."
         return False
 
     order = {
@@ -781,6 +940,7 @@ def initialize_lcd():
         log(f"Invalid LCD_INTERFACE {LCD_INTERFACE!r} (expected auto/gpio/i2c).",
             "ERROR")
         lcd_online = False
+        lcd_last_error = f"Invalid LCD_INTERFACE: {LCD_INTERFACE!r}"
         return False
 
     errors = []
@@ -788,6 +948,7 @@ def initialize_lcd():
         try:
             attempt()
             lcd_online = True
+            lcd_last_error = None
             lcd_show("Access Control", "Ready")
             return True
         except Exception as e:
@@ -797,7 +958,8 @@ def initialize_lcd():
 
     lcd_online = False
     lcd_interface_used = None
-    log("LCD not available (will run without it): " + " | ".join(errors),
+    lcd_last_error = " | ".join(errors)
+    log("LCD not available (will run without it): " + lcd_last_error,
         "WARNING")
     return False
 
@@ -807,19 +969,22 @@ def lcd_show(line1="", line2=""):
     available, so call sites never need to check lcd_online themselves.
     Identical for both interfaces -- RPLCD's I2C and GPIO CharLCD classes
     share the same write_string/cursor_pos/clear API."""
-    global lcd_online, lcd
+    global lcd_online, lcd, lcd_last_error
     if not lcd_online or lcd is None:
-        return
+        return False
     with _lcd_lock:
         try:
             lcd.clear()
             lcd.write_string(line1[:LCD_COLS])
             lcd.cursor_pos = (1, 0)
             lcd.write_string(line2[:LCD_COLS])
+            return True
         except Exception as e:
             lcd_online = False
             lcd = None
-            log(f"LCD write failed: {e}", "WARNING")
+            lcd_last_error = f"LCD write failed: {e}"
+            log(lcd_last_error, "WARNING")
+            return False
 
 
 def test_lcd():
@@ -829,13 +994,8 @@ def test_lcd():
     which are typically write-only with R/W tied to GND; I2C displays
     CAN be read back, but RPLCD's i2c backend doesn't verify writes
     either, so the caveat applies to both interfaces as implemented)."""
-    if not lcd_online:
-        return False
-    lcd_show("Hello!", "LCD Working :)")
-    return True
+    return lcd_show("Hello!", "LCD Working :)")
 
-
-# --------------------------------------------------------------- scanner ---
 
 # ---------------------------------------------------------- access rules --
 
@@ -876,11 +1036,13 @@ def register_denial():
     state["consecutive_failures"] += 1
     if state["consecutive_failures"] >= LOCKOUT_THRESHOLD:
         state["lockout_count"] += 1
+        locked_at = time.time()
         cooldown = min(
             LOCKOUT_SECONDS * (LOCKOUT_BACKOFF_MULTIPLIER ** (state["lockout_count"] - 1)),
             LOCKOUT_MAX_SECONDS,
         )
-        state["locked_until"] = time.time() + cooldown
+        state["locked_until"] = locked_at + cooldown
+        state["last_lockout"] = locked_at
         state["consecutive_failures"] = 0
         save_database()
         return cooldown
@@ -899,14 +1061,20 @@ def register_success():
 
 
 def decay_lockout_backoff():
-    """Slowly forgives the backoff level after a long period with no new
-    lockouts, so a legitimate user who was locked out once a long time ago
-    isn't stuck with an ever-growing cooldown forever. Called once at
-    startup and once when entering scanner mode."""
+    """Reduce the backoff by one level for each full day without a lockout."""
     state = config["lockout_state"]
+    now = time.time()
     if state["lockout_count"] > 0 and current_lockout_remaining() == 0:
-        state["lockout_count"] = 0
-        save_database()
+        last_lockout = state.get("last_lockout", now)
+        if not isinstance(last_lockout, (int, float)):
+            last_lockout = now
+        elapsed_intervals = int((now - last_lockout) // LOCKOUT_BACKOFF_DECAY_SECONDS)
+        if elapsed_intervals > 0:
+            state["lockout_count"] = max(0, state["lockout_count"] - elapsed_intervals)
+            state["last_lockout"] = last_lockout + elapsed_intervals * LOCKOUT_BACKOFF_DECAY_SECONDS
+            if state["lockout_count"] == 0:
+                state["last_lockout"] = 0
+            save_database()
 
 
 # --------------------------------------------------------------- scanner ---
@@ -928,6 +1096,9 @@ def scanner_mode():
     lcd_show("Access Control", "Ready")
 
     while not shutdown_requested:
+        if not rfid_online:
+            recover_rfid_reader()
+        decay_lockout_backoff()
         remaining = current_lockout_remaining()
         if remaining > 0:
             lcd_show("LOCKED OUT", f"Wait {int(remaining)}s")
@@ -957,6 +1128,7 @@ def scanner_mode():
             if not finger_sensor_online:
                 hardware_error = True
                 print("Fingerprint sensor is offline; access cannot be verified.")
+                security_event("access_denied", reason="fingerprint_sensor_offline", uid=uid)
                 lcd_show("SENSOR OFFLINE", "Access unavailable")
                 status = "HARDWARE_OFFLINE"
                 slot = name = None
@@ -966,8 +1138,10 @@ def scanner_mode():
             if status == "SUCCESS":
                 schedule = config["user_schedules"].get(str(slot))
                 if not is_within_schedule(schedule):
+                    schedule_label = (f"{schedule.get('start', '?')}-{schedule.get('end', '?')}"
+                                      if isinstance(schedule, dict) else "invalid schedule")
                     print(f"\n{'='*50}\nACCESS DENIED\n{name} is outside their "
-                          f"allowed access hours ({schedule['start']}-{schedule['end']}).\n{'='*50}")
+                          f"allowed access hours ({schedule_label}).\n{'='*50}")
                     security_event("access_denied", reason="outside_schedule",
                                     user=name, slot=slot, schedule=schedule)
                     buzz_denied()
@@ -987,10 +1161,11 @@ def scanner_mode():
             elif status == "COMMUNICATION_ERROR":
                 hardware_error = True
                 print("\nAUTHENTICATION UNAVAILABLE: fingerprint sensor comms failed.")
+                security_event("access_denied", reason="fingerprint_comms_error", uid=uid)
                 buzz_denied()
                 lcd_show("SENSOR ERROR", "Try again later")
             elif status == "HARDWARE_OFFLINE":
-                pass
+                security_event("access_denied", reason="fingerprint_sensor_offline", uid=uid)
             elif status == "SHUTDOWN":
                 break
             else:
@@ -1018,7 +1193,6 @@ def scanner_mode():
         time.sleep(1.5)
         if current_lockout_remaining() == 0:
             lcd_show("Access Control", "Ready")
-
     print("\n" + "=" * 50 + "\nScanner stopped.\n" + "=" * 50 + "\n")
 
 
@@ -1083,6 +1257,7 @@ def validate_schedule(schedule):
     return True, ""
 
 
+@serialized_fingerprint
 def enroll_fingerprint():
     print("\n" + "=" * 50 + "\nNEW FINGERPRINT ENROLLMENT\n" + "=" * 50)
 
@@ -1093,6 +1268,10 @@ def enroll_fingerprint():
     name = input("Enter user name: ").strip()
     if not name:
         print("Name cannot be empty.")
+        return
+    if any(str(existing).strip().casefold() == name.casefold()
+           for existing in config["user_mappings"].values()):
+        print("That user name is already enrolled. Choose a unique name.")
         return
 
     slot = find_next_free_slot()
@@ -1171,8 +1350,15 @@ def enroll_fingerprint():
             config["user_schedules"].pop(str(slot), None)
 
         if not save_database():
-            print(f"\nWARNING: fingerprint stored in sensor slot #{slot} ('{name}'), "
-                  f"but database save failed.")
+            config["user_mappings"].pop(str(slot), None)
+            config["user_schedules"].pop(str(slot), None)
+            rollback_ok = _delete_sensor_template(slot)
+            message = ("Enrollment was rolled back because the database could not be saved."
+                       if rollback_ok else
+                       f"DATABASE SAVE FAILED: slot #{slot} remains on the sensor and must be deleted manually.")
+            print(f"\n{message}")
+            security_event("enrollment_database_save_failed", user=name, slot=slot,
+                           sensor_rollback_succeeded=rollback_ok)
             return
 
         print(f"\n{'='*50}\nENROLLMENT SUCCESSFUL\nUser: {name}  Slot: #{slot}\n{'='*50}")
@@ -1184,6 +1370,21 @@ def enroll_fingerprint():
         log(f"Enrollment error: {e}", "ERROR")
 
 
+@serialized_fingerprint
+def _delete_sensor_template(slot):
+    """Best-effort rollback for an enrollment whose local save failed."""
+    try:
+        result = finger.delete_model(slot)
+    except (OSError, RuntimeError) as e:
+        log(f"Could not roll back sensor slot #{slot}: {e}", "ERROR")
+        return False
+    if result != adafruit_fingerprint.OK:
+        log(f"Could not roll back sensor slot #{slot}: {result_name(result)}", "ERROR")
+        return False
+    return True
+
+
+@serialized_fingerprint
 def delete_fingerprint():
     print("\n" + "=" * 50 + "\nREGISTERED FINGERPRINTS\n" + "=" * 50)
 
@@ -1229,10 +1430,32 @@ def delete_fingerprint():
             print(f"Failed to delete sensor template: {result_name(result)}")
             return
 
-        del config["user_mappings"][str(target_slot)]
-        config["user_schedules"].pop(str(target_slot), None)
+        slot_key = str(target_slot)
+        del config["user_mappings"][slot_key]
+        config["user_schedules"].pop(slot_key, None)
         if not save_database():
-            print("WARNING: sensor template deleted, but database update failed.")
+            # Keep the in-memory deletion so a retry can persist it
+            # (sensor is already empty). Do NOT restore memory here:
+            # restoring would make a retry try to delete an already-empty
+            # sensor slot and get stuck. Instead, retry the save now.
+            print("WARNING: sensor template deleted, but the database update failed. "
+                  "Retrying save before anything else...")
+            security_event("fingerprint_deletion_database_save_failed", user=target,
+                           slot=target_slot)
+            try:
+                retry = input("Retry database save now? (Y/n): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                retry = "n"
+                print()
+            if retry in ("", "y", "yes"):
+                if save_database():
+                    print(f"Retry succeeded. Successfully deleted '{target}'.")
+                    security_event("fingerprint_deleted", user=target, slot=target_slot)
+                    return
+            print("Save still failed. DO NOT RESTART yet: the database on disk "
+                  "still lists this user but the sensor slot is empty. Fix disk "
+                  "space/permissions then use Manage Users / Edit Schedule to "
+                  "trigger another save before exiting.")
             return
 
         print(f"Successfully deleted '{target}'.")
@@ -1301,11 +1524,13 @@ def get_status_dict():
             "interface": "i2c", "expander": LCD_I2C_EXPANDER,
             "address": addr if addr == "auto-detected" else hex(addr),
             "bus": LCD_I2C_PORT,
+            "detection": "I2C address acknowledged",
         }
     elif lcd_online and lcd_interface_used == "gpio":
         lcd_active = {
             "interface": "gpio", "pin_rs": LCD_PIN_RS, "pin_e": LCD_PIN_E,
             "pins_data": LCD_PINS_DATA,
+            "detection": "GPIO initialized; confirm visually",
         }
 
     return {
@@ -1344,6 +1569,7 @@ def get_status_dict():
         },
         "lcd": {
             "online": lcd_online,
+            "last_error": lcd_last_error,
             "cols": LCD_COLS,
             "rows": LCD_ROWS,
             "configured_interface": LCD_INTERFACE,
@@ -1410,6 +1636,8 @@ def show_status():
     lcd = s["lcd"]
     print(f"  Status: {'ONLINE' if lcd['online'] else 'OFFLINE (system runs fine without it)'}")
     print(f"  Size: {lcd['cols']}x{lcd['rows']}  |  Configured interface: {lcd['configured_interface']}")
+    if lcd["last_error"]:
+        print(f"  Diagnostic: {lcd['last_error']}")
     if lcd["active"] and lcd["active"]["interface"] == "i2c":
         a = lcd["active"]
         print(f"  Active: I2C  |  Expander: {a['expander']}  |  "
@@ -1418,6 +1646,7 @@ def show_status():
         a = lcd["active"]
         print(f"  Active: GPIO  |  Pins (BOARD): RS={a['pin_rs']} "
               f"E={a['pin_e']} D4-D7={a['pins_data']}")
+        print(f"  Detection: {a['detection']}")
     if lcd["online"]:
         if input("  Test LCD now? (y/N): ").strip().lower() == "y":
             if test_lcd():
@@ -1522,7 +1751,11 @@ def edit_user_schedule():
     if save_database():
         name = config["user_mappings"][slot]
         print(f"\nSchedule updated for {name} (slot #{slot}).")
-        security_event("schedule_updated", user=name, slot=slot, schedule=schedule)
+        try:
+            slot_num = int(slot)
+        except (ValueError, TypeError):
+            slot_num = slot
+        security_event("schedule_updated", user=name, slot=slot_num, schedule=schedule)
     else:
         print("Schedule changed in memory, but database save failed.")
 
@@ -1581,37 +1814,36 @@ def cleanup():
     global uart
     print()
     log("Shutting down hardware...")
-    if buzzer_online:
-        try:
-            _buzzer_off()
-        except Exception:
-            pass
     if lcd_online and lcd is not None:
         try:
             lcd.clear()
             lcd.close(clear=True)
         except Exception:
             pass
+    with _buzzer_lock:
+        _buzzer_off()
     try:
         GPIO.cleanup()
     except Exception as e:
         log(f"GPIO cleanup error: {e}", "WARNING")
-    if uart is not None:
-        try:
-            uart.close()
-        except OSError as e:
-            log(f"UART cleanup error: {e}", "WARNING")
-        uart = None
+    with fingerprint_lock:
+        if uart is not None:
+            try:
+                uart.close()
+            except OSError as e:
+                log(f"UART cleanup error: {e}", "WARNING")
+            uart = None
     log("Shutdown complete.")
 
 
 def initialize_hardware(progress_cb=None, cancel_event=None):
-    """Brings up all four peripherals, then behaves according to
-    REQUIRE_ALL_HARDWARE -- the single place that controls whether
-    hardware is mandatory. This is the ONLY function that should decide
-    that; callers (main() below, and the GUI's splash screen) both call
-    this instead of branching on REQUIRE_ALL_HARDWARE themselves, so the
-    two interfaces can never disagree about what's required.
+    """Brings up the RFID reader, fingerprint sensor, buzzer, and LCD, then
+    behaves according to REQUIRE_ALL_HARDWARE -- the single place that
+    controls whether the four mandatory ones are required. This is the
+    ONLY function that should decide that; callers (main() below, and
+    the GUI's splash screen) both call this instead of branching on
+    REQUIRE_ALL_HARDWARE themselves, so the two interfaces can never
+    disagree about what's required.
 
     If REQUIRE_ALL_HARDWARE is True: retries indefinitely (every
     HARDWARE_RETRY_SECONDS) until every one of RFID/fingerprint/buzzer/
@@ -1631,9 +1863,9 @@ def initialize_hardware(progress_cb=None, cancel_event=None):
 
     Init order matters: initialize_buzzer() must run before
     initialize_rfid(), because SimpleMFRC522 forces GPIO.setmode
-    (GPIO.BOARD) internally, and both the buzzer and LCD also need BOARD
-    mode -- setting it via the buzzer first means every later GPIO user
-    just reuses the same mode instead of conflicting with it.
+    (GPIO.BOARD) internally, and the buzzer and LCD also need
+    BOARD mode -- setting it via the buzzer first means every later GPIO
+    user just reuses the same mode instead of conflicting with it.
 
     Special case (REQUIRE_ALL_HARDWARE only): if the LCD is the only
     thing missing, there's no display to show that on, so a distinct
@@ -1700,6 +1932,9 @@ def main():
     install_signal_handlers()
     print(f"\n{'='*50}\n RFID + FINGERPRINT ACCESS SYSTEM  (v{VERSION})\n{'='*50}")
     try:
+        if not acquire_database_lock():
+            log("Another access-control instance is already running; database lock unavailable.", "ERROR")
+            return
         load_database()
         decay_lockout_backoff()
 
@@ -1718,7 +1953,8 @@ def main():
         log(f"Fatal application error: {e}", "ERROR")
     finally:
         cleanup()
+        release_database_lock()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit("run.py is the shared application backend. Start the GUI with: python3 gui.py")
