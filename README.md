@@ -1,233 +1,235 @@
-# Access Control System
+# Access Control
 
-A two-factor physical access control system for the Raspberry Pi. A user scans an RFID card, then verifies their identity with a fingerprint sensor. Access is granted only if both factors match. As of v1.5, **all four peripherals — RFID reader, fingerprint sensor, buzzer, and LCD — are mandatory**: the system will not start the menu until every one of them initializes successfully. Includes a setup script that checks and configures the Pi automatically.
+A beginner-friendly, GUI-only two-factor access-control app for a Raspberry Pi. Access is granted only after the configured **master RFID card** and a registered **fingerprint** are both verified. `gui.py` is the application entry point; `run.py` provides the hardware and access-control backend.
 
-## How it works
+The buzzer and LCD are optional feedback devices. The GUI can start without them, but their features remain unavailable until connected.
 
-1. On startup, the system checks all four required peripherals (RFID, fingerprint sensor, buzzer, LCD). If any is missing, it retries every 5 seconds, logs what's missing, shows it on the LCD if the LCD itself is up, and sounds a distinct buzzer alert pattern — the app will not proceed to the menu until all four are online.
-2. Scan an RFID card on the reader.
-3. If the card matches the stored master UID (the system's sole admin), the fingerprint sensor activates.
-4. If the fingerprint matches a registered user, and that user is within their allowed access hours (if any are set), access is granted.
-5. Every attempt (granted, denied, error) is logged with a timestamp and a session ID that ties together every event from a single scan-to-result cycle.
-6. After repeated failed attempts, the system locks out scanning. The lockout cooldown escalates (roughly doubling) with each new lockout and persists across restarts, then slowly decays back to normal after enough clean time has passed.
+## Before you begin
 
-## Hardware
+This guide uses **physical pin numbers** on the Raspberry Pi's 40-pin header, also called `BOARD` numbering. These are not BCM/GPIO numbers used by many online tutorials.
 
-| Component | Model used | Connection |
-|---|---|---|
-| Raspberry Pi | Any model with SPI + UART (tested on Pi 3/4) | — |
-| RFID reader | MFRC522 | SPI |
-| Fingerprint sensor | R307 / R307s | UART (`/dev/serial0`) |
-| Buzzer | Active or passive | GPIO (BOARD pin 12 by default) |
-| LCD | 16x2 character LCD — either an I2C backpack (PCF8574) or direct-wired GPIO | I2C (pins 3/5) or GPIO (BOARD pins 32/29/13/15/18/16 by default) — see "16x2 LCD" below |
+Your direct-wired 1602A/16x2 LCD uses GPIO mode by default:
 
-**All four components above are required as of v1.5.** The system will not enter the menu or scanner mode unless every one initializes successfully at startup — see "Mandatory hardware check" below.
-
-## Wiring (Raspberry Pi 3B+)
-
-All pin numbers below are **physical (BOARD) pin numbers** on the 40-pin header, matching what the code and `setup.sh` expect.
-
-### MFRC522 (RFID reader) — SPI
-
-| MFRC522 pin | Pi physical pin | Pi function |
-|---|---|---|
-| 3.3V | 1 (or 17) | 3.3V power — **do not use 5V** |
-| RST | 22 | Any free GPIO |
-| GND | 6 (or any GND) | Ground |
-| IRQ | not connected | — |
-| MISO | 21 | SPI0 MISO |
-| MOSI | 19 | SPI0 MOSI |
-| SCK | 23 | SPI0 SCLK |
-| SDA (SS/CS) | 24 | SPI0 CE0 |
-
-### R307 / R307s (fingerprint sensor) — UART
-
-| R307 wire | Pi physical pin | Pi function |
-|---|---|---|
-| VCC | 2 or 4 | 5V power |
-| GND | 6 (or any GND) | Ground |
-| TX | 10 | GPIO15 / RXD (Pi RX ← sensor TX) |
-| RX | 8 | GPIO14 / TXD (Pi TX → sensor RX) |
-
-The sensor runs its logic at 3.3V-compatible UART levels but is typically powered from 5V — check your specific module's datasheet before wiring. TX/RX must be crossed (sensor TX → Pi RX, sensor RX → Pi TX), which the table above already reflects.
-
-### Buzzer — GPIO
-
-| Buzzer pin | Pi physical pin | Pi function |
-|---|---|---|
-| Signal / + | 12 | GPIO18 (PWM-capable) |
-| GND / − | 6 (or any GND) | Ground |
-
-Works with either active or passive buzzers — the code drives it with software PWM either way. If you wire it to a different physical pin, update `BUZZER_PIN` in `run.py` to match. **This component is mandatory as of v1.5** — see "Mandatory hardware check" below.
-
-### 16x2 LCD — I2C or GPIO direct-wired
-
-Two wiring styles are supported, controlled by `LCD_INTERFACE` in `run.py` (default `"auto"`, which tries I2C first and falls back to GPIO — so either display type works without editing any settings). **This component is mandatory as of v1.5** regardless of which interface is used.
-
-#### Option A: I2C backpack (PCF8574) — 4 wires, recommended
-
-| LCD backpack pin | Pi physical pin | Pi function |
-|---|---|---|
-| VCC | 2 or 4 | 5V power |
-| GND | 6 (or any GND) | Ground |
-| SDA | 3 | I2C1 SDA |
-| SCL | 5 | I2C1 SCL |
-
-Enable I2C first (`sudo raspi-config` → Interface Options → I2C), then confirm the backpack's address with `i2cdetect -y 1` (usually `0x27` or `0x3F`). By default `LCD_I2C_ADDRESS = None` in `run.py`, which auto-scans both common addresses; set it explicitly if your backpack uses a different one. Requires the `smbus2` package (installed by `setup.sh`).
-
-#### Option B: direct-wired GPIO, no backpack — 6 signal wires
-
-All numbers are **physical (BOARD) pin numbers**, to match the RFID reader and buzzer above — RPi.GPIO only allows one numbering mode per process, so every piece of hardware in this project has to agree on BOARD.
-
-| LCD pin | LCD pin name | Pi physical pin | Pi function |
-|---|---|---|---|
-| 1 | VSS (GND) | 6 (or any GND) | Ground |
-| 2 | VDD (+5V) | 2 or 4 | 5V power |
-| 3 | V0 (contrast) | — | Via resistor to GND rail — contrast adjustment |
-| 4 | RS | 32 | Any free GPIO |
-| 5 | R/W | — | Tie to GND rail (always write mode) |
-| 6 | E | 29 | Any free GPIO |
-| 11 | D4 | 13 | Any free GPIO — **moved**, see note below |
-| 12 | D5 | 15 | Any free GPIO — **moved**, see note below |
-| 13 | D6 | 18 | Any free GPIO |
-| 14 | D7 | 16 | Any free GPIO |
-| 15 | A (backlight +) | — | Via resistor to +5V rail |
-| 16 | K (backlight −) | — | GND rail |
-
-**Note on D4/D5:** if you're following an existing wiring plan for this LCD, you may have seen D4 → pin 24 and D5 → pin 22 elsewhere. Those two specific pins are already used by the RFID reader in this project (SDA/CS and RST respectively), so D4 and D5 have been moved here to pins 13 and 15 instead — physically adjacent to D6/D7 (18/16), so the wiring stays easy to lay out on a breadboard. RS, E, D6, and D7 are unchanged from a typical wiring plan. If you rewire the LCD to different physical pins, update `LCD_PIN_RS`, `LCD_PIN_E`, and `LCD_PINS_DATA` in `run.py` to match.
-
-A GPIO-wired display is write-only (R/W is tied to GND), so the app can confirm the pins toggled correctly but can't confirm the screen actually displayed anything — a totally blank screen (no backlight) with GPIO wiring is almost always a power/contrast/backlight wiring issue, not a software one. An I2C display can be confirmed present with `i2cdetect` before you even run the app, which is easier to debug.
-
-## OS setup (what actually needs to be configured, and why)
-
-The sensor needs a clean, dedicated UART — by default the Pi's serial port
-is either occupied by a login shell, or (on boards with onboard Bluetooth)
-shared with Bluetooth on an unstable clock. Both have to be dealt with.
-
-**1. Enable the UART and turn off the serial login shell.**
-
-Either via `sudo raspi-config` → Interface Options → Serial Port →
-"login shell over serial" = **No**, "serial hardware enabled" = **Yes** —
-or by editing `/boot/firmware/config.txt` directly and confirming
-`cmdline.txt` has no `console=serial0,...` entry. Verified working values:
-
-`/boot/firmware/config.txt`, in the `[all]` section:
-```
-enable_uart=1
-dtoverlay=disable-bt
+```python
+LCD_INTERFACE = "gpio"
 ```
 
-`/boot/firmware/cmdline.txt` — should **not** contain a `console=serial0...`
-or `console=ttyAMA0...` entry. Just `console=tty1` (plus your normal root/
-boot parameters) is correct.
+Do not copy a standalone LCD wiring example unchanged into this full project. Several common LCD pins clash with the MFRC522 RFID reader's SPI pins.
 
-**2. Free the full UART from Bluetooth.**
+## Parts
 
-`dtoverlay=disable-bt` above does the actual work — without it,
-`/dev/serial0` maps to the mini-UART, which Bluetooth also uses and whose
-clock isn't stable enough for reliable 57600 baud, causing intermittent
-read errors. As a belt-and-suspenders step (not strictly required once the
-overlay is set, but prevents Bluetooth from ever re-claiming the interface
-after an OS update), also disable the service:
+| Part | Needed? | Notes |
+|---|---|---|
+| Raspberry Pi with 40-pin header | Yes | Pi 3, 4, or similar with SPI and UART |
+| MFRC522 RFID reader | Yes for scanning | **3.3 V only** |
+| R307/R307s fingerprint sensor | Yes for scanning | Usually powered from 5 V |
+| 16x2 HD44780/1602A LCD | Optional | Direct GPIO wiring is below |
+| Active or passive buzzer | Optional | Audio feedback |
+| Full-size breadboard and jumpers | Recommended | Safely distributes power and signals |
+| 10 kΩ potentiometer | Recommended | LCD contrast control |
+| 220–1 kΩ resistor | Maybe needed | LCD backlight, unless built into your module |
+
+## Breadboard safety
+
+1. Shut down and unplug the Pi before changing wires.
+2. Every module must share the Pi's ground.
+3. Keep separate breadboard rails for 5 V and 3.3 V.
+4. Connect the MFRC522 only to **3.3 V**. Never connect it to 5 V.
+5. Use one power source only. Do not back-feed the Pi through its 5 V pin.
+6. Some breadboards split their power rails halfway along; bridge the halves or use one side only.
+
+```text
+Pi physical pin 2 or 4 (5 V)   -> breadboard +5 V rail
+Pi physical pin 1 or 17 (3.3 V)-> breadboard +3.3 V rail
+Pi physical pin 6 (GND)        -> breadboard GND rail
+
+LCD and fingerprint sensor     -> use +5 V where stated below
+MFRC522                         -> use +3.3 V only
+All module grounds              -> common GND rail
+```
+
+## Complete wiring map
+
+All Pi pins in this guide are **physical pin numbers**.
+
+### MFRC522 RFID reader (SPI)
+
+| MFRC522 pin | Pi pin | Purpose |
+|---|---:|---|
+| 3.3V | 1 or 17 | 3.3 V power only |
+| GND | 6 | Ground |
+| RST | 22 | Reset |
+| SDA / SS | 24 | SPI CE0 chip-select |
+| SCK | 23 | SPI clock |
+| MOSI | 19 | SPI MOSI |
+| MISO | 21 | SPI MISO |
+| IRQ | Leave unconnected | Not used |
+
+### Fingerprint sensor (UART)
+
+| Sensor wire | Pi pin | Purpose |
+|---|---:|---|
+| VCC | 2 or 4 | 5 V power, if specified by your sensor |
+| GND | 6 | Ground |
+| TX | 10 | Pi RXD—sensor sends data to Pi |
+| RX | 8 | Pi TXD—Pi sends data to sensor |
+
+TX and RX are crossed. Check your sensor's voltage specification. If its RX input is not explicitly 3.3 V tolerant, use a logic-level converter between Pi pin 8 and sensor RX.
+
+### Buzzer (optional)
+
+| Buzzer pin | Pi pin |
+|---|---:|
+| Signal / `+` | 12 |
+| GND / `−` | 6 |
+
+For a bare buzzer that needs more current than a GPIO can supply, use a transistor driver rather than connecting it directly.
+
+### Direct-wired 16x2 LCD (default GPIO mode)
+
+Only LCD data pins D4–D7 are used. D0–D3 stay unconnected.
+
+| LCD pin | Label | Connect to | Notes |
+|---:|---|---:|---|
+| 1 | VSS | GND rail | Ground |
+| 2 | VDD | 5 V rail | Power |
+| 3 | V0 | 10 kΩ potentiometer wiper | Pot outer legs go to 5 V and GND |
+| 4 | RS | Pi 32 | GPIO signal |
+| 5 | R/W | GND rail | Write-only mode |
+| 6 | E | Pi 29 | GPIO signal |
+| 11 | D4 | Pi 13 | GPIO signal |
+| 12 | D5 | Pi 15 | GPIO signal |
+| 13 | D6 | Pi 18 | GPIO signal |
+| 14 | D7 | Pi 16 | GPIO signal |
+| 15 | A / LED+ | 5 V through resistor if needed | Backlight positive |
+| 16 | K / LED− | GND rail | Backlight ground |
+
+### Critical LCD pin-conflict warning
+
+Many LCD-only tutorials use physical pins **24**, **22**, and **26**. Do not use those pins for this project:
+
+| LCD signal | Do not use | Conflict | Use instead |
+|---|---:|---|---:|
+| D4 | 24 | MFRC522 SPI CE0 | 13 |
+| D5 | 22 | MFRC522 reset | 15 |
+| E | 26 | SPI CE1 | 29 |
+
+Keep RS → 32, D6 → 18, and D7 → 16. If an LCD-only test works but the complete project fails, these conflicting pins are the likely cause.
+
+> A blue backlight with no text usually means the LCD has power but contrast is wrong. Turn the 10 kΩ potentiometer slowly before changing code.
+
+### Optional I2C LCD backpack
+
+The software also supports an I2C backpack. Set `LCD_INTERFACE = "i2c"` in `run.py`, then wire VCC → 5 V, GND → ground, SDA → physical pin 3, and SCL → physical pin 5. Setup enables I2C when available; reboot if setup says one is needed.
+
+## Software setup
+
+1. Copy or clone this project to your Pi.
+2. Run setup:
+
+   ```bash
+   chmod +x setup.sh
+   sudo ./setup.sh
+   ```
+
+   No extra flag is needed: `setup.sh` automatically installs missing packages, adds the login user to required groups, enables SPI/UART/I2C when needed through `raspi-config`, and disables the serial login shell. It also checks GPIO, LCD pins, and optional hardware. If it changes a Pi interface, reboot when it tells you to.
+
+3. If asked, reboot:
+
+   ```bash
+   sudo reboot
+   ```
+
+4. Start the GUI from the Pi desktop terminal:
+
+   ```bash
+   python3 gui.py
+   ```
+
+The touchscreen GUI requires a desktop display session. `run.py` is the shared backend and is not the app to launch.
+
+### Manual Pi interface settings (fallback only)
+
+Normally you do not need this section because `setup.sh` performs these actions automatically. Use it only if setup reports that `raspi-config` is unavailable or a configuration step failed.
+
+Open:
 
 ```bash
-sudo systemctl disable bluetooth.service
-sudo systemctl mask bluetooth.service
+sudo raspi-config
 ```
 
-**3. Reboot, then verify.**
+Under **Interface Options**:
 
-```bash
-sudo reboot
-ls -l /dev/serial0
-```
+- Enable **SPI** for the MFRC522.
+- Enable **Serial Port hardware** for the fingerprint sensor.
+- Disable the **serial login shell** so it does not occupy the fingerprint UART.
+- Enable **I2C** only when using an I2C LCD backpack.
 
-You want to see:
-```
-serial0 -> ttyAMA0
-```
+## First run
 
-If it instead points to `ttyS0`, `disable-bt` didn't take effect — check
-`config.txt` and reboot again.
+1. Launch `python3 gui.py` and wait for startup to finish.
+2. Open **Master Card**, then scan the RFID card that will be the administrator card.
+3. Open **Enroll User**, enter a unique user name, and follow the two fingerprint prompts.
+4. Open **Start Scanner** and press **Start Scanning** to test access.
 
-> **Note on Raspberry Pi 5:** the UART is routed through the RP1 I/O chip
-> rather than directly off the SoC, so `/dev/serial0` behaves slightly
-> differently under the hood than on Pi 3/4/Zero. The same two settings
-> (`enable_uart=1` + `dtoverlay=disable-bt`) are still correct and
-> sufficient — RP1 doesn't change what you need to set, just how it's
-> implemented internally.
+The scanner needs the master RFID card first, then a fingerprint registered in the local database.
 
-## Software Setup
+## GUI screens
 
-Clone the repository onto your Pi, then run the setup script to check and configure everything needed:
+| Screen | Action |
+|---|---|
+| Start Scanner | Scan cards and verify fingerprints |
+| Enroll User | Register a fingerprint and optional access hours |
+| Manage Users | Change schedules or delete a user |
+| Master Card | Set or replace the administrator RFID card |
+| System Status | Review hardware/database status and test buzzer/LCD |
+| Security Log | Review recent security events |
 
-```bash
-chmod +x setup.sh
-sudo ./setup.sh --auto
-```
+## Troubleshooting
 
-If SPI or UART was enabled for the first time, reboot before continuing:
+### LCD is backlit but no text appears
 
-```bash
-sudo reboot
-```
+1. Adjust the 10 kΩ contrast potentiometer on LCD pin 3 (V0).
+2. Confirm LCD pin 5 (R/W) is connected to ground.
+3. Confirm `LCD_INTERFACE = "gpio"` in `run.py`.
+4. Recheck the six signal pins: RS 32, E 29, D4 13, D5 15, D6 18, D7 16.
+5. Ensure D4/D5/E are not connected to 24/22/26 from an LCD-only tutorial.
+6. Open **System Status**, run **Test LCD**, and read the diagnostic there.
 
-## Running
+### LCD works alone but fails with RFID connected
 
-```bash
-python3 run.py
-```
+There is a pin conflict. Rewire LCD E, D4, and D5 to physical pins 29, 13, and 15. Keep the MFRC522 on its SPI pins.
 
-You'll see a menu:
+### RFID reader is offline
 
-```
-1. Start Scanner Mode
-2. Enroll New Fingerprint
-3. Delete Fingerprint
-4. Change Master RFID Card (also lets you set a display name for the admin)
-5. Show System Status
-6. View Recent Security Logs
-7. Edit User Access Schedule
-8. Exit
-```
+- Confirm it is powered from 3.3 V, never 5 V.
+- Enable SPI, then reboot.
+- Recheck SDA/SS → 24, SCK → 23, MOSI → 19, MISO → 21, and RST → 22.
 
-On first run, set a master RFID card (option 4) before starting the scanner.
+### Fingerprint sensor is offline
 
-## Roles
+- Confirm TX/RX are crossed: sensor TX → Pi 10; sensor RX → Pi 8.
+- Enable serial hardware and disable the serial login shell.
+- Confirm the sensor has power and shares ground with the Pi.
 
-There are no configurable roles in this build. **The master RFID card holder is the sole admin** — enrolling/deleting fingerprints, changing the master card, and editing schedules are all menu actions available to whoever is running `run.py` at the terminal (there's no separate login for the app itself; physical/terminal access to the Pi is the actual admin boundary). Every enrolled fingerprint is a regular user, subject to whatever access schedule (if any) is set for their slot.
+### A device says OFFLINE but the GUI starts
 
-The master card can optionally be given a display name (set via **Change Master RFID Card**, option 4) — if set, it's shown when the card is scanned and in **Show System Status**; if left blank, the admin is just labeled "admin".
+This is intentional. Hardware is optional at startup. Use **System Status** to see the failing component and LCD error details.
 
-## Enrolling a user
-
-1. Choose **Enroll New Fingerprint** from the menu.
-2. Enter the user's name.
-3. Place the same finger on the sensor twice, as prompted.
-4. Optionally set an access-hours restriction (e.g. `09:00-18:00`) — leave blank for unrestricted access. Overnight windows like `22:00-06:00` are supported.
-5. The fingerprint is stored on the sensor itself; only the name, slot number, and schedule are saved locally.
-
-You can change a user's schedule later without re-enrolling via **Edit User Access Schedule** (option 7).
-
-## Lockout behavior
-
-After 3 consecutive denied attempts, scanning locks out for a cooldown period. Unlike a simple fixed cooldown, this build:
-
-- **Escalates**: each new lockout roughly doubles the previous cooldown (10s → 20s → 40s → ...), capped at 300 seconds, so repeated failed attempts take progressively longer.
-- **Persists across restarts**: the lockout and escalation state live in `fingerprint_database.json`, so restarting the app (or the Pi) does not reset an active lockout or the escalation level.
-- **Decays over time**: once a lockout period has fully expired without triggering again, the escalation level resets back down, so a single lockout long ago doesn't permanently saddle a legitimate user with a longer cooldown.
-
-Current lockout state (remaining cooldown, consecutive failures, and escalation count) is visible any time via **Show System Status** (option 5).
-
-## Files created at runtime
+## Data files
 
 | File | Purpose |
 |---|---|
-| `fingerprint_database.json` | Master RFID UID, slot-to-name mappings, per-user schedules, and persistent lockout state |
-| `fingerprint_database.json.bak` | Automatic backup, written before each save |
-| `access_log.jsonl` | Line-delimited log of every access attempt and admin action (mirrors the latest daily log, kept for tools that expect a fixed filename) |
-| `logs/access_log-YYYY-MM-DD.jsonl` | One log file per calendar day, so logs don't grow without bound; each line includes a `session` ID correlating every event from a single RFID-scan-to-result cycle |
+| `fingerprint_database.json` | Master RFID UID, users, schedules, and lockout state |
+| `fingerprint_database.json.bak` | Backup made before database saves |
+| `access_log.jsonl` | Latest security-event log |
+| `logs/access_log-YYYY-MM-DD.jsonl` | Daily rotated security logs |
 
-## LCD status messages
+Do not edit `fingerprint_database.json` while the application is running. Back it up before making manual changes.
 
-When idle it shows `Access Control / Ready`. During a scan it mirrors the flow: `Card detected / Checking...`, then `RFID OK / Scan finger...` while waiting on the fingerprint sensor, then a two-line `ACCESS GRANTED` (with the user's name) or `ACCESS DENIED` (with the reason — unknown card, finger mismatch, timeout, or outside allowed hours) result. During a lockout it shows `LOCKED OUT / Wait Ns` with the live remaining cooldown. At startup, if any required peripheral is missing, it shows `HARDWARE ERROR` with the missing component name(s) (when the LCD itself is one of the ones that's up). You can test it independently any time from the menu: **Show System Status** (option 5) → LCD section → "Test LCD now?".
+## Security notes
+
+- The master RFID card is the first factor; a registered fingerprint is the second.
+- Anyone with physical access to the Pi or its logged-in desktop can use the administration screens. Secure the Pi and its user account.
+- Repeated denials trigger a persistent, escalating lockout.
+- Do not publish database or log files: they contain RFID identifiers and user names.
